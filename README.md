@@ -289,6 +289,14 @@ given previously in the ["XML Configuration File"](#xml-configuration-file) sect
                      },
                    ],
 
+# Emacs Integration
+
+This program integrates with the
+[choice-program](https://github.com/plandes/choice-program) library.
+
+See [synconf.el](https://github.com/plandes/synconf/synconf.el) for an example
+configuration.
+
 # COPYRIGHT
 
 Copyright (C) 2009 - 2017  Paul Landes

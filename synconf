@@ -2,6 +2,8 @@
 
 # Copyright (C) 2009 - 2017 Paul Landes
 # Written by Paul Landes 05/21/2005
+#
+# https://github.com/plandes/synconf
 
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -1009,6 +1011,15 @@ given previously in the L<XML Configuration File> section:
                                  }, ],
                    },
                  ],
+
+=head1 Emacs Integration
+
+This program integrates with the
+L<choice-program|https://github.com/plandes/choice-program> library.
+
+See L<synconf.el|https://github.com/plandes/synconf/synconf.el> for an example
+configuration.
+
 
 =head1 COPYRIGHT
 
