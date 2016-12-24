@@ -951,8 +951,6 @@ Skip creating new files on receiver.  See the B<--existing> rsync option.
 
 =back
 
-=back
-
 
 =item Element B<pathset>
 
@@ -982,6 +980,9 @@ after variable substitution and expansion.
 Specifying this initiates a recursive I<chmod> on the directory specified after
 I<rsync> completes.  This is useful to run on a UNIX machine for syncing from a
 windows mounted file system.
+
+=back
+
 
 =head1 Perl Native Configuration
 

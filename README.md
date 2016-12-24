@@ -291,7 +291,7 @@ given previously in the ["XML Configuration File"](#xml-configuration-file) sect
 
 # COPYRIGHT
 
-Copyright (C) 2009  Paul Landes
+Copyright (C) 2009 - 2017  Paul Landes
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -310,16 +310,4 @@ Boston, MA 02111-1307, USA.
 
 # AUTHOR
 
-Paul Landes &lt;landes at mailc dot net>
-
-# POD ERRORS
-
-Hey! **The above document had some coding errors, which are explained below:**
-
-- Around line 958:
-
-    '=item' outside of any '=over'
-
-- Around line 987:
-
-    You forgot a '=back' before '=head1'
+Paul Landes
