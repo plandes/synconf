@@ -1,0 +1,1035 @@
+#!/usr/bin/env perl
+
+# Copyright (C) 2009 - 2017 Paul Landes
+# Written by Paul Landes 05/21/2005
+
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING.  If not, write to the
+# Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+# Boston, MA 02111-1307, USA.
+
+# Commentary: synchronize disconnected directories
+
+use strict;
+use Getopt::Long;
+use Pod::Usage;
+use Sys::Hostname;
+
+my ($DEBUG, $PROG, $VERSION, %SYNC_CONF, %COMMANDS, $DEFAULT_BOPTIONS,
+    %CONF_TO_OPTION, %ACTIONS, $CONF_PATH);
+
+# gives pretty verbose debugging (ala Data::Dumper)
+our $DEBUG = 0;
+
+BEGIN {
+  # use this when XML::LibXML isn't available, see docs on how to populate this
+  %SYNC_CONF = ();
+
+  # subvserion populates this
+  $_ = q/$Revision$/;
+  /\$Revision: (\d+) \$/;
+  $VERSION = $1;
+
+  # default location of the (undehydrated) configuration file
+  $CONF_PATH = "$ENV{HOME}/opt/var/db/synconf.xml";
+
+  $PROG = "synconf";
+  $DEFAULT_BOPTIONS = "rltpgoDu";
+  %ACTIONS = ( sync => "sync",
+	       print => "print",
+	       getMnemonic => "listmnemonics",
+	     );
+
+  ## params:
+  # 1:  the short rsync option to add
+  # 2:  l=long option, s=short option (think switch: a `-' in front),
+  # 3:  is 'f' means "should format", so a `%s' is replace with the
+  #     value givin in the config
+  # 4:  negative option (removes from $DEFAULT_BOPTIONS)
+  # 5:  c=apply `canPath' to `%s' value to canonize the path, 3rd param
+  #     must be 'f'
+  %CONF_TO_OPTION = ( delete => [ "--delete", 'l' ],
+		      backup => [ "--backup --backup-dir=%s", 'l', 'f', undef, 'c' ],
+		      noCvs => [ "-C --exclude=.git", 'l' ],
+#		      noGit => [ "--exclude=.git", 'l' ],
+		      clobberNewer => [ "u", 's', undef, 1 ],
+		      followLinks => [ "l", 's', undef, 1 ],
+		      noPerms => [ "p", 's', undef, 1 ],
+		      verbose => [ "v", 's' ],
+		      dryRun => [ "n", 's' ],
+		      chmod => [ 0, 'n' ],
+		      dsStore => [ "--exclude=.DS_Store", 'l' ],
+		      rsyncPath => [ "--rsync-path=%s", 'l', 'f' ],
+
+		      # value defaults to 'ssh' (per rsync implementation)
+		      rsh => [ "--rsh=%s", 'l', 'f' ],
+
+		      # extra excludes (i.e. CCRC .copyarea.db)
+		      exclude => [ "--exclude=%s", 'l', 'f' ],
+
+		      # no option handling, hard coding for
+		      # <username>@<host>:<path> notation
+		      user => [],
+
+		      existing => [ "--existing", 'l' ],
+		      checksum => [ "--checksum", 'l' ],
+		    );
+
+  %COMMANDS = ( rsync => "rsync", chmod => "chmod", find => "find" );
+}
+
+# Prints out the _synchronization configuration_ data structure.
+# params:
+#   none
+sub printSyncConfig {
+  my ($syncConf) = getSyncConfig();
+
+  while ( my ($host, $hostEntry) = each %$syncConf ) {
+    print "Host: $host\n";
+
+    while ( my ($mnemonic, $rsyncEntries) = each %$hostEntry ) {
+      print ' ' x 2, "Mnemonic: $mnemonic\n";
+
+      foreach my $rsyncEntry (@$rsyncEntries) {
+	my ($fileSets, $attribs) =
+	  ($rsyncEntry->{filesSync}, $rsyncEntry->{attribs});
+
+	print ' ' x 4, "Options: ";
+	print join(", ", map { "$_ -> $attribs->{$_}" } keys(%$attribs));
+	print "\n", ' ' x 4, "Files:\n";
+
+	for my $filePair (@$fileSets) {
+	  my ($src, $dst) = @$filePair;
+	  my @src = glob($src);
+	  for my $src (@src) {
+	    print ' ' x 6, "$src -> $dst\n";
+	  }
+	}
+      }
+    }
+
+    print "\n";
+  }
+}
+
+sub canPath {
+  my $vars;
+  ($_, $vars) = @_;
+  s/^~\//$ENV{HOME}\//;
+  return substVars($_, $vars);
+}
+
+sub getXMLSyncConfig {
+  my ($fileName, $conf) = @_;
+
+  use XML::LibXML;
+
+  my $parser = XML::LibXML->new();
+  my $doc = $parser->parse_file($fileName);
+  my $root = $doc->documentElement();
+  my %vars;
+  my @defaultNodes;
+
+  for my $varsNode ($root->getElementsByTagName("vars")) {
+    parseXMLProperties($varsNode, \%vars, \%vars);
+  }
+
+  for my $defaultsNode ($root->getElementsByTagName("defaults")) {
+    for my $pNode ($defaultsNode->getElementsByTagName("property")) {
+      push @defaultNodes, $pNode;
+    }
+  }
+
+  for my $hostNode ($root->getElementsByTagName("host")) {
+    my $pHostNode = {};
+    $conf->{$hostNode->getAttribute('name')} = $pHostNode;
+
+    for my $mnemonicNode ($hostNode->getElementsByTagName("mnemonic")) {
+      my $pMnemonicNode = [];
+      $pHostNode->{$mnemonicNode->getAttribute('name')} = $pMnemonicNode;
+
+      for my $packageNode ($mnemonicNode->getElementsByTagName("package")) {
+	my $pPackageNode = {};
+	my $pathSetNode = ($packageNode->getElementsByTagName("pathset"))[0];
+	my (@paths, %props, @mods);
+	push @$pMnemonicNode, $pPackageNode;
+
+	for my $pathNode ($pathSetNode->getElementsByTagName("path")) {
+	  push @paths, [ canPath($pathNode->getAttribute('src'), \%vars),
+			 canPath($pathNode->getAttribute('dst'), \%vars) ];
+	}
+
+	for my $pNode (@defaultNodes) {
+	  populateProp(\%props, \%vars, $pNode);
+	}
+
+	for my $pNode ($packageNode->getElementsByTagName("property")) {
+	  populateProp(\%props, \%vars, $pNode);
+	}
+
+	for my $modNode ($packageNode->getElementsByTagName("modify")) {
+	  my $path = canPath($modNode->getAttribute('path'), \%vars);
+	  my $mode = $modNode->getAttribute('mode');
+	  $mode = substVars($mode, \%vars);
+
+	  push @mods, { dirs => [ $path ], mode => $mode };
+	}
+
+	$pPackageNode->{filesSync} = \@paths if (@paths > 0);
+	$pPackageNode->{attribs} = \%props if (%props > 0);
+	$pPackageNode->{dirMod} = \@mods if (@mods > 0);
+      }
+    }
+  }
+}
+
+# Returns the _synchronization configuration_ data structure.
+sub getSyncConfig {
+  my $fileName = $CONF_PATH;
+
+  if ( -f $fileName ) {
+    my %conf;
+    getXMLSyncConfig($fileName, \%conf);
+    if ($DEBUG) {
+      use Data::Dumper;
+      print Dumper(\%conf);
+      print Dumper(\%SYNC_CONF);
+      exit 0;
+    }
+    return \%conf;
+  } else {
+    return \%SYNC_CONF;
+  }
+}
+
+# Return the local host's name
+sub getHostName {
+  my $hash = @_[0];
+  my $name = hostname();
+
+  if ( (defined $hash) && (! (exists $hash->{$name}) ) ) {
+    $name = 'localhost';
+  }
+
+  return $name;
+}
+
+# Exit the program with an error message (goes to standard error).
+#
+# params:
+#    $errrorMsg - string message to print
+#    $exitVal - exit code to return from the program
+#    $noPod - if true, then don't print POD
+sub croak {
+  my ($errorMsg, $exitVal) = @_;
+
+  $exitVal = 1 if (! defined $exitVal);
+
+  pod2usage( { -message => "$PROG: $errorMsg",
+	       -exitval => $exitVal,
+	       -verbose => 0,
+	       -output  => \*STDOUT } );
+}
+
+# Return the mnemonics available for a host/_synchronization configuration_
+# data structure.
+# params:
+#   $hostName (optional) - the host name to use for the lookup; defaults to
+#                          localhost
+#   $syncConfig (optional) - the _synchronization configuration_ data
+#                            structure to use if given, otherwise, use
+#                            getSyncConfig(); defaults to local config
+sub getMnemonics {
+  my ($hostName, $syncConfig) = @_;
+  my ($hostEntry);
+
+  $syncConfig = getSyncConfig() if (! $syncConfig);
+  $hostName = getHostName($syncConfig) if (! $hostName);
+  $hostEntry = $syncConfig->{$hostName};
+
+  return keys(%$hostEntry);
+}
+
+# Return the list of rsync entries for a host and mnemonic.
+#
+# params:
+#   $mnemonic - the mnemonic to use for determining, which list to use (see
+#               POD docs)
+#   $noDie (optional) - boolean, if true, don't error out if no matching
+#                       config was found for this host
+#   $hostName (optional) - the host name to use for the lookup; defaults to
+#                          localhost
+#   $syncConfig (optional) - the _synchronization configuration_ data
+#                            structure to use if given, otherwise, use
+#                            getSyncConfig(); defaults to local config
+sub getRsyncEntries {
+  my ($mnemonic, $noDie, $hostName, $syncConfig) = @_;
+  my ($hostEntry, $rsyncEntries);
+
+  $syncConfig = getSyncConfig() if (! $syncConfig);
+  $hostName = getHostName($syncConfig) if (! $hostName);
+  $hostEntry = $syncConfig->{$hostName};
+
+  if (! defined $hostEntry) {
+    my $msg = "no defined mapping for host `$hostName'";
+    croak($msg) if (!$noDie);
+    return $msg;
+  }
+
+  $rsyncEntries = $hostEntry->{$mnemonic};
+  if (! defined $rsyncEntries) {
+    my $msg = "no defined mapping for mnemonic `$mnemonic'";
+    croak($msg) if (!$noDie);
+    return undef;
+  }
+
+  return $rsyncEntries;
+}
+
+# Populate a 2D array list.  Each element of the returned list is 2 array list
+# of the form [ FROM, TO ] directories.  Return a descriptive error string if
+# a host configuration or mnemonic entry was not found, otherwise, return
+# `undef'.
+#
+# params:
+#   $mnemonic - the mnemonic to use for determining, which list to use (see
+#               POD docs)
+#   $dirsToPopulate - an array reference, which will be populated with two
+#                     entry arrays (source, destination) directory pairs.
+#   $noDie (optional) - boolean, if true, don't error out if no matching
+#                       config was found for this host
+#   $syncConfig (optional) - the _synchronization configuration_ data
+#                            structure to use if given, otherwise, use
+#                            getSyncConfig(); defaults to local config
+sub getDirPairsToSync {
+  my ($rsyncEntry, $dirsToPopulate) = @_;
+  my $fileSets = $rsyncEntry->{filesSync};
+
+  for my $filePair (@$fileSets) {
+    my ($src, $dst) = @$filePair;
+    my @src = glob($src);
+    for my $src (@src) {
+      push @$dirsToPopulate, [ $src, $dst ];
+    }
+  }
+}
+
+# Create the directory rsync commands.
+#
+# params:
+# $rsyncEntry - the rsync entry to create commands on; this is the data
+#               structure that contains the file directory pair lists
+# $attribs - attribute map reference that indicates actions or additional
+#            information about commands that are to be created
+# $cmdsToPopulate - a reference in which to add generated commands
+sub createSyncCommands {
+  my ($rsyncEntry, $attribs, $cmdsToPopulate) = @_;
+  my (@dirPairs, $options, @longOptions);
+
+  print "attribs: ", Dumper($attribs), "\n" if ($DEBUG);
+
+  # create command line options from attributes
+  $options = $DEFAULT_BOPTIONS;
+  while ( my ($key, $val) = each %$attribs ) {
+    if ($val) {
+      my $ctoEntry = $CONF_TO_OPTION{$key};
+      if (! defined $ctoEntry) {
+	print STDERR "$PROG: warning, no configuration option defined for: ",
+	  $key, "\n";
+      } else {
+	my ($optionStr, $optionType, $shouldFormat, $negOption, $canPath) = @$ctoEntry;
+	if ($shouldFormat) {
+	  $val = canPath($val) if ($canPath eq 'c');
+	  $optionStr = sprintf $optionStr, $val;
+	}
+	if ($optionType eq 'l') {
+	  push @longOptions, $optionStr;
+	} elsif ($optionType eq 's') {
+	  print "short option ($optionType): ", Dumper($ctoEntry), "\n" if ($DEBUG);
+	  if ($negOption) {
+	    print "NEG OPTION: $optionStr\n" if ($DEBUG);
+	    $options =~ s/$optionStr//g;
+	  } else {
+	    $options .= $optionStr;
+	  }
+	}
+      }
+    }
+  }
+
+  # create the short and long options string to insert right after the
+  # command
+  $options = "-" . $options if (length $options);
+  $options .= " " if (length $options and scalar(@longOptions) > 0);
+  $options .= join(" ", @longOptions);
+
+  getDirPairsToSync($rsyncEntry, \@dirPairs);
+
+  #  for my $dirPair (@dirPairs) {
+  #    my $cmd = "$COMMANDS{rsync} $options $dirPair->[0] $dirPair->[1]";
+  #    push @$cmdsToPopulate, { cmd => $cmd, execute => 1 };
+  #  }
+
+  my %dstDirToSrcs;
+  for my $dirPair (@dirPairs) {
+    my $dirArr = $dstDirToSrcs{$dirPair->[1]};
+    if (! defined $dirArr) {
+      $dirArr = [];
+      $dstDirToSrcs{$dirPair->[1]} = $dirArr;
+    }
+    push @$dirArr, $dirPair->[0];
+  }
+
+  #  use Data::Dumper;
+  #  print Dumper(\%dstDirToSrcs);
+
+  for my $dst (keys(%dstDirToSrcs)) {
+    my $srcs = $dstDirToSrcs{$dst};
+    my $user = $attribs->{user};
+    my $cmd;
+
+    if (index(join("", @$srcs), ":") > 1) {
+      # if any source is from a foreign host, split up into each command
+      for my $src (@$srcs) {
+	$cmd = "$COMMANDS{rsync} $options " . mkPath($src, $user) . ' ' . mkPath($dst, $user);
+	push @$cmdsToPopulate, { cmd => $cmd, execute => 1 };
+      }
+    } else {
+      # otherwise, rsync handles multiple local sources to one destination
+      $cmd = "$COMMANDS{rsync} $options " . join(" ", map { mkPath($_, $user) } @$srcs) . ' ' . mkPath($dst, $user);
+      push @$cmdsToPopulate, { cmd => $cmd, execute => 1 };
+    }
+  }
+}
+
+sub mkPath {
+  my ($path, $user) = @_;
+
+  if (defined $user) {
+    $path = $user . '@' . $path if ($path =~ /:/);
+  }
+
+  return $path;
+}
+
+
+# Create a directory modification commands (i.e. recursive dir/file chmods).
+#
+# params:
+# $rsyncEntry - the rsync entry to create commands on; this is the data
+#               structure that contains the file directory pair lists
+# $attribs - attribute map reference that indicates actions or additional
+#            information about commands that are to be created
+# $cmdsToPopulate - a reference in which to add generated commands
+sub createDirModCommands {
+  my ($rsyncEntry, $attribs, $cmdsToPopulate) = @_;
+
+  # add directory modifications
+  for my $dirMod (@{$rsyncEntry->{dirMod}}) {
+    my @dirs = map(glob, @{$dirMod->{dirs}});
+    my $mode = $dirMod->{mode};
+    for my $dir (@dirs) {
+      my $cmd = qq
+	^$COMMANDS{find} $dir -type f -exec $COMMANDS{chmod} $mode {} \\;^;
+      push @$cmdsToPopulate, { cmd => $cmd,
+			       execute => ! $attribs->{dryRun} };
+    }
+  }
+}
+
+# Build an rsync command based on criteria passed in, namely a mnemonic and
+# host.  The commands are added to the array reference `$cmdsToPopulate'.
+#
+# params:
+#   $mnemonic - the mnemonic to use for determining, which list to use (see
+#               POD docs)
+#   $cmdsToPopulate - array reference gets populated, each element is a string
+#                     that contains the constructed rsync command; if more
+#                     than one, there are multiple directories to sync
+#   $attribOverride - boolean options to override; overrides the options in the
+#                _synchronization configuration_ data structure
+#   $noDie (optional) - boolean, if true, don't error out if no matching
+#                       config was found for this host
+#   $syncConfig (optional) - the _synchronization configuration_ data
+#                            structure to use if given, otherwise, use
+#                            getSyncConfig(); defaults to local config
+sub buildCommands {
+  my ($mnemonic, $cmdsToPopulate, $attribOverride, $noDie,
+      $hostName, $syncConfig) = @_;
+  my ($rsyncEntries);
+
+  $rsyncEntries = getRsyncEntries($mnemonic, $noDie, $hostName, $syncConfig);
+
+  # if we don't have an entry for this host/mnemonic pair, don't do anything
+  foreach my $rsyncEntry (@$rsyncEntries) {
+    my (%attribs);
+
+    # create the attribute set for this invocation
+    if (exists $rsyncEntry->{attribs}) {
+      %attribs = %{$rsyncEntry->{attribs}};
+    }
+
+    # user can override default attribute settings from the command line
+    if (defined $attribOverride) {
+      while ( my ($key, $val) = each %$attribOverride ) {
+	$attribs{$key} = $val;
+      }
+    }
+
+    createSyncCommands($rsyncEntry, \%attribs, $cmdsToPopulate);
+    createDirModCommands($rsyncEntry, \%attribs, $cmdsToPopulate);
+  }
+}
+
+# Synchronize command first build the rsync command and then invokes it
+#
+# params:
+#   $mnemonic - the mnemonic to use for determining, which list to use (see
+#               POD docs)
+#   $verbosity - the number (higher the more) of how verbose to be (default 1)
+#   $attribOverride - boolean options to override; overrides the options in the
+#                _synchronization configuration_ data structure
+#   $continueOnError - if non-zero, continue invoking subsequent rsync
+#                      commands even if the previous one failed
+#   $printCmds - only print rsync commands, do not execute (not even -n to rsync)
+sub sync {
+  my ($mnemonic, $verbosity, $attribOverride, $continueOnError, $printCmds) = @_;
+  my (@cmds, $expectedExit);
+
+  buildCommands($mnemonic, \@cmds, $attribOverride);
+  $expectedExit = $continueOnError ? 0 : undef;
+
+  for my $cmd (@cmds) {
+    if ($printCmds) {
+      print $cmd->{cmd}, "\n";
+    } else {
+      executeCommand($cmd, $verbosity, $expectedExit);
+    }
+  }
+}
+
+main();
+
+sub main {
+  my ($doExit, $exitMsg, $exitVal, $verboseLevel, $exitHandle,
+      $action, $mnemonic, $dryRun, $verbose, $printCmds) =
+	(0, '', 0, 0, \*STDERR, $ACTIONS{sync});
+  my ($help, $longhelp, $version);
+
+  if ( !GetOptions("help" => \$help,
+		   "longhelp" => \$longhelp,
+		   "shout" => \$verbose,
+		   "version" => \$version,
+		   "action=s" => \$action,
+		   "mnemonic=s" => \$mnemonic,
+		   "norun" => \$dryRun,
+		   "print" => \$printCmds,
+		   "config=s" => \$CONF_PATH,
+		  )) {
+    ($doExit, $exitVal) = (1, 1);
+  } elsif ($help) {
+    ($doExit, $exitVal, $verboseLevel, $exitHandle) = (1, 0, 1, \*STDOUT);
+  } elsif ($longhelp) {
+    ($doExit, $exitVal, $verboseLevel, $exitHandle) = (1, 0, 2, \*STDOUT);
+  } elsif ($version) {
+    print "v$VERSION\n";
+    exit 0;
+  } elsif (! defined $action) {
+    ($doExit, $exitVal, $exitMsg) = (1, 1, "missing action option (-a)");
+  } else {
+    if ($action eq $ACTIONS{sync}) {
+      if (! defined $mnemonic) {
+	($doExit, $exitVal, $exitMsg) = (1, 1, "missing mnemonic option (-m)");
+      } else {
+	my %attribOverride = ( dryRun => $dryRun, verbose => $verbose);
+	sync($mnemonic, undef, \%attribOverride, 0, $printCmds);
+      }
+    } elsif ($action eq $ACTIONS{getMnemonic}) {
+      my $mnemonics = join("\n", getMnemonics());
+      print $mnemonics;
+      print "\n" if (length $mnemonics);
+    } elsif ($action eq $ACTIONS{print}) {
+      printSyncConfig();
+    } else {
+      ($doExit, $exitVal, $exitMsg) =
+	(1, 1, "no defined action `" . $action . "'");
+    }
+  }
+
+  if ($doExit) {
+    if (length $exitMsg) {
+      $exitMsg = "$PROG: $exitMsg";
+    } else {
+      undef $exitMsg;
+    }
+
+    pod2usage( { -message => $exitMsg,
+		 -exitval => $exitVal,
+		 -verbose => $verboseLevel,
+		 -output  => $exitHandle } );
+  }
+}
+
+
+## lib functions
+
+# Exit the program with an error message (goes to standard error).
+#
+# params:
+#    $errrorMsg - string message to print
+#    $exitVal - exit code to return from the program
+#    $verbose - if given (defined), print usage inforomation at that POD
+#               verbosity level
+sub croak {
+  my ($errorMsg, $exitVal, $verbose) = @_;
+
+  $exitVal = 1 if (! defined $exitVal);
+
+  if (defined $verbose) {
+    my $h = $exitVal ? \*STDERR : \*STDOUT;
+    if (defined $errorMsg) {
+      pod2usage( { -message => "$PROG: $errorMsg",
+		   -exitval => $exitVal,
+		   -verbose => $verbose,
+		   -output  => \*STDOUT } );
+    } else {
+      pod2usage( { -exitval => $exitVal,
+		   -verbose => $verbose,
+		   -output  => \*STDOUT } );
+    }
+  } else {
+    print STDOUT "$PROG: $errorMsg\n";
+  }
+
+  exit $exitVal;
+}
+
+# Execute a command by shelling out (fork/exec) and wait for the response.
+#
+# params:
+#   $cmd - the command to invoke
+#   $verbosity - the number (higher the more) of how verbose to be (default 1)
+#   $expectedExit - if defined, bail on any return value from command that is
+#                   not equal, otherwise, just return the exit code of $cmd
+#   $extraEnv - additional environment variables (hash) to set for the
+#               execution
+sub executeCommand {
+  my ($cmdEntry, $verbosity, $expectedExit, $extraEnv) = @_;
+  my ($cmd, $doExecute) = ($cmdEntry->{cmd}, $cmdEntry->{execute});
+  my ($ret);
+
+  $verbosity = 1 if (! defined $verbosity);
+  $ret = 1 if (! defined $verbosity);
+
+  print "executing: $cmd\n" if ($verbosity > 0);
+  if (($verbosity > 1) && (defined $extraEnv)) {
+    print "enviornemnt:\n";
+    while ( my ($k, $v) = each %$extraEnv ) { print "$k => $v\n"; }
+  }
+
+  if ($doExecute) {
+    my %org = %ENV;
+    if (defined $extraEnv) {
+      while ( my ($k, $v) = each %$extraEnv ) { $ENV{$k} = $v; }
+    }
+    $ret = system($cmd) / 256;
+    %ENV = %org;
+  } else {
+    $ret = $expectedExit;
+  }
+
+  if (defined $expectedExit and $ret != $expectedExit) {
+    croak("command `$cmd' failed ($ret)");
+  }
+
+  return $ret;
+}
+
+sub substVars {
+  my $vars;
+  ($_, $vars) = @_;
+  while ( my ($name, $val) = each %$vars ) {
+    s/\${$name}/$val/g;
+  }
+  return $_;
+}
+
+sub populateProp {
+  my ($props, $vars, $pNode) = @_;
+  my $val = $pNode->getAttribute('value');
+  my $type = $pNode->getAttribute('type');
+  $val = substVars($val, $vars);
+  if ( ($type ne 'string') && (($val eq 'true') || ($val eq 'false')) ) {
+    $val = ($val eq 'true') ? 1 : 0;
+  }
+  $props->{$pNode->getAttribute('name')} = $val;
+}
+
+sub parseXMLProperties {
+  my ($parent, $props, $vars) = @_;
+  for my $pNode ($parent->getElementsByTagName("property")) {
+    populateProp($props, $vars, $pNode);
+  }
+}
+
+
+__END__
+
+=head1 NAME
+
+synconf - synchronize disconnected directories (i.e. laptops, USB memory pens).
+
+
+=head1 SYNOPSIS
+
+    synconf  < -a/--action <print | listmnemonics> >
+    synconf  < -a/--action sync > < -m/--mnemonic <host mnemonic> >
+             [ -s/--shout ] [ -n/--norun ]
+    synconf  [ -h/--help ] [ -v/--version ]
+
+
+=head1 DESCRIPTION
+
+B<synconf> will Synchronize data using rsync for detached large media
+devices like laptops, USB memory pens, etc.  It does other related tasks like
+adjusting permissions on files, which are useful for things like synchronizing
+from the MS Windows world (where permissions are arbitrary) to UNIX.
+
+
+=head1 TERMS
+
+=over 2
+
+=item B<synchronization configuration>
+
+A list of hosts each with a configuration that is keyed by a I<mnemonic>.
+Each I<mnemonic> contains the list of directories (globs) which associated
+default options.
+
+The mnemonic is something the user must provide to indicate which set of
+directories to synchronize.  For instance, for host B<X> you might want to
+synchronize from a memory pen (or laptop, etc).  You might want to call this
+mnemonic C<fromusb> since it synchronizes from the memory pen to the local
+machine.
+
+Similarly, you include a C<tousb> that synchronizes files from the local
+machine back on to the memory pen.
+
+=back
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-a, --action>
+
+Indicates what to do.  The action can be one of:
+
+=over 8
+
+=item <sync>
+
+This is the primary synchronize command.  This command invokes L<rsync> that
+does the file syncronization from one server and/or filesystem to another.
+
+=item <print>
+
+This prints the I<synchronization configuration> (see L<TERMS> section).
+
+=item <listmnemonics>
+
+Lists the mnemonics that used for this host.
+
+=back
+
+=item B<-m, --mnemonic>
+
+This indicates which list of directories to sync for the C<sync> action (see
+-a).
+
+=item B<-c, --config> I<configuration file>
+
+Specifies the XML configuration file used to indicate what to sync and how.
+
+=item B<-s, --shout>
+
+Provide verbose logging.  This passes C<-v> given to L<rsync>.
+
+=item B<-n, --norun>
+
+Do a dryrun.  That is, act like the script is running for real but don't do
+anything (this is the same C<-n> given to L<rsync>).
+
+=item B<-h, --help>
+
+Print a brief help message and exits.
+
+=item B<-l, --longhelp>
+
+Prints the long help page and exists.
+
+=item B<-v, --version>
+
+Prints program version and exists.
+
+=back
+
+
+=head1 XML Configuration File
+
+The configuration file defines what is to be synced and how.
+
+Here is a simple example:
+
+  <sync>
+    <vars>
+      <property name="views" value="emacs,home-dir"/>
+    </vars>
+    <defaults>
+      <property name="checksum" value="true"/>
+    </defaults>
+    <host name="localhost">
+      <mnemonic name="laptop">
+        <package>
+          <pathset>
+            <path src="pluto:~/view/{${views},bsh}" dst="~/view"/>
+            <path src="pluto:~/opt/var/tosync" dst="~/opt/var"/>
+          </pathset>
+          <property name="delete" value="true"/>
+          <property name="noPerms" value="true"/>
+          <property name="noCvs" value="true"/>
+          <property name="user" value="plandes"/>
+          <modify path="~/view/emacs" mode="0664"/>
+        </package>
+      </mnemonic>
+    </host>
+  </sync>
+
+In this example, we recursively synchronize files from ~/view/emacs,
+~/view/home-dir on host pluto to the same directories on the local box.  The
+one and only configuration is for mnemonic C<laptop> and is always used as the
+host name uses the wildcard C<localhost>.
+
+When synchronizing in this example, we delete files on host pluto that aren't
+local, we don't copy C<.git>, C<.CVS> or C<.svn> directories, we use user
+C<plandes> to login to pluto and we chmod all files to C<0664> locally after
+we're done.
+
+Since we've defined C<checksum> as a default, it's aplies to our one and only
+configuration, so it checks by checksum instead of file size and time.
+
+=over 4
+
+=item Element B<property>
+
+Properties define a key value pair and appear in more than one place (i.e. in
+B<default> and B<vars>.  If the definition only lists the name of the property,
+then it is a boolean property with legal values C<true> and C<false> with
+C<false> as the default without it's presence.
+
+=item Element B<vars>
+
+The vars element contains C<property> nodes that are later substituted in
+the form C<${I<variable name>}>.
+
+=item Element B<defaults>
+
+The vars element contains C<property> nodes that are copied for each and every
+C<pathset> element.  You can override this by declaring yet another property
+with the same name and different value.
+
+=item Element B<host>
+
+The host element contains configuration for the host the program runs on (not
+the remote host).  This is useful for networked shared configuration files or
+even configurations that get rsynced.  The B<name> attribute is the host name
+or can be C<localhost>, which is used when a the local host name isn't found in
+the definition.
+
+=item Element B<mnemonic>
+
+Identifies which sync configuration to use for the mnemonic supplied on the
+command line with B<-m>, which referenced by the B<name> attribute.
+
+=item Element B<package>
+
+A package is a list of paths and properties that apply specifically to that
+package.  In this example, we synchronize by deleting all files/elements
+locally that aren't on I<pluto>, we don't change permissions, don't copy
+C<.git>, C<.CVS>, C<.svn> directories and use the user of I<plandes>.
+
+In the B<package> element, the following properties using the mentioned
+B<property> element are valid and apply (note that these are different from the
+B<vars/property> elements):
+
+=over 4
+
+=item B<delete>
+
+Delete files/elements at the destination that aren't at the source.  See the
+B<--delete> rsync option.
+
+=item B<backup> I<directory>
+
+With this option, preexisting destination files are renamed as each file is
+transferred or deleted.  The files removed/deleted go in I<directory>.  See the
+B<--backup> rsync option.
+
+=item B<noCvs>
+
+See the B<--cvs-exclude> rsync option.
+
+=item B<noPerms>
+
+Opposite of the B<--perms> in rsync (i.e. B<--no-perms>).
+
+=item B<clobberNewer>
+
+Opposite of the B<-u> (-B<update>) in rsync.  This overwrites al files that differ from
+source even if the target has newer (timestamp) files.
+
+=item B<followLinks>
+
+Opposite of the B<-l> (-B<links>) in rsync.  This follows (symbolic) links
+instead of copying them over as links.
+
+=item B<verbose>
+
+See the B<--verbose> rsync option.
+
+=item B<dryRun>
+
+See the B<--dry-run> rsync option.
+
+=item B<chmod> I<mode>
+
+Change mode (B<chmod>) recursively using I<mode>.
+
+=item B<dsStore>
+
+Like B<noCvs> but applies to Apple .DS_Store files.
+
+=item B<rsyncPath> I<path on server>
+
+See the B<--rsync-path> rsync option.
+
+=item B<rsh> I<path on server>
+
+See the B<--rsh> rsync option.
+
+=item B<exclude> I<file pattern>
+
+See the B<--exclude> rsync option.
+
+=item B<user>
+
+User to login in as on the remote host.  In rsync, this is the user in the
+form:
+
+=over 2
+
+B<user>@host:path
+
+=back
+
+You can also put the user in the B<src> and B<dst> attributes of the B<pathset>
+element, but it isn't recommended and both can't be present.
+
+=item B<existing>
+
+Skip creating new files on receiver.  See the B<--existing> rsync option.
+
+=back
+
+=back
+
+
+=item Element B<pathset>
+
+This is the list of paths to synchronize.  Attribute B<src> contains where it
+comes from, which is either a local directory or a remote directory in the
+form:
+
+=over 2
+
+<I<host>>:<B<path>>
+
+=back
+
+and in this case is I<pluto>:B<~/opt/var/tosync>.
+
+When paths are in a comma separated list in curly braces, they are expanded
+like BSD UNIX paths.  In our example, I<pluto>:B<~/view/{${views},bsh}> becomes:
+
+  pluto:~/view/emacs
+  pluto:~/view/home-dir
+  pluto:~/view/bsh
+
+after variable substitution and expansion.
+
+=item Element B<modify>
+
+Specifying this initiates a recursive I<chmod> on the directory specified after
+I<rsync> completes.  This is useful to run on a UNIX machine for syncing from a
+windows mounted file system.
+
+=head1 Perl Native Configuration
+
+If the Perl library C<XML::LibXML> isn't available, you can require in or
+modify the script itself to include in the C<BEGIN> the same data structure as
+would be read in from the XML file.
+
+Here's an example of that data structure that is equivelant to the XML example
+given previously in the L<XML Configuration File> section:
+
+  %SYNC_CONF =
+    (
+     "pluto" =>
+     {
+      fromusb => [ { filesSync => [[ "pluto:~/view/{emacs,home-dir,bsh}",
+                                     "$ENV{HOME}/view" ],
+                                   [ "pluto:~/opt/var/tosync",
+                                     "$ENV{HOME}/opt/var" ],
+                                  ],
+                     attribs => { delete => 1, noPerms => 1,
+                                  user => 'plandes', noCvs => true },
+                     dirMod => [ { dirs => [ "$ENV{HOME}/view/emacs" ],
+                                   mode => "0664",
+                                 }, ],
+                   },
+                 ],
+
+=head1 COPYRIGHT
+
+Copyright (C) 2009 - 2017  Paul Landes
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; see the file COPYING.  If not, write to the
+Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+Boston, MA 02111-1307, USA.
+
+=head1 AUTHOR
+
+Paul Landes
+
+=cut
