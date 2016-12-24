@@ -294,8 +294,8 @@ given previously in the ["XML Configuration File"](#xml-configuration-file) sect
 This program integrates with the
 [choice-program](https://github.com/plandes/choice-program) library.
 
-See [synconf.el](https://github.com/plandes/synconf/synconf.el) for an example
-configuration.
+See [synconf.el](https://github.com/plandes/synconf/blob/master/synconf.el) for
+an example configuration.
 
 # COPYRIGHT
 
