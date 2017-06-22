@@ -7,4 +7,5 @@ doc:
 	pod2markdown $(PROG) > $(README)
 
 .PHONY: install
+install:
 	sudo install $(PROG) $(INST_DIR)
