@@ -25,7 +25,7 @@
 use strict;
 use Getopt::Long;
 use Pod::Usage;
-use Sys::Hostname;
+use Net::Domain qw (hostname);
 
 my ($DEBUG, $PROG, $VERSION, %SYNC_CONF, %COMMANDS, $DEFAULT_BOPTIONS,
     %CONF_TO_OPTION, %ACTIONS, $CONF_PATH);
