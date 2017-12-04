@@ -658,10 +658,11 @@ sub executeCommand {
 }
 
 sub substVars {
-  my $vars;
+  my ($vars, $reg);
   ($_, $vars) = @_;
   while ( my ($name, $val) = each %$vars ) {
-    s/\${$name}/$val/g;
+      $reg = "\$\\{${name}\\}";
+      s/$reg/$val/g;
   }
   return $_;
 }
