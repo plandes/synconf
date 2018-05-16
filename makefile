@@ -1,12 +1,26 @@
 PROG=		synconf
 INST_DIR=	/usr/local/bin
+LOCAL_INST_DIR=	$(HOME)/opt/lib/perl/$(PROG)
 README=		README.md
-P2M=		pod2markdown 
+POD2MARK=	pod2markdown 
+POD2MAN=	pod2man
+
+.PHONY:	instp2mark
+instp2mark:
+		cpan install pod2markdown
+
 
 .PHONY: doc
 doc:
-	$(P2M) $(PROG) > doc/pod.md
+		mkdir -p doc
+		$(POD2MARK) $(PROG) > doc/pod.md
 
 .PHONY: install
 install:
-	sudo install $(PROG) $(INST_DIR)
+		sudo install $(PROG) $(INST_DIR)
+
+.PHONY:	localinstall
+localinstall:
+		mkdir -p $(LOCAL_INST_DIR)/bin $(LOCAL_INST_DIR)/man1
+		cp $(PROG) $(LOCAL_INST_DIR)/bin
+		$(POD2MAN) $(PROG) > $(LOCAL_INST_DIR)/man1/$(PROG).1
