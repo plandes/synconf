@@ -20,14 +20,14 @@ See [synconf.el] for an example configuration.
 
 ## License
 
-Copyright © 2016 - 2017 Paul Landes
+Copyright © 2016 - 2019 Paul Landes
 
 GNU Lesser General Public License, Version 2.0
 
 
 ## Copyright
 
-Copyright (C) 2009 - 2017  Paul Landes
+Copyright (C) 2009 - 2019  Paul Landes
 
 
 <!-- links -->

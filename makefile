@@ -24,3 +24,7 @@ localinstall:
 		mkdir -p $(LOCAL_INST_DIR)/bin $(LOCAL_INST_DIR)/man1
 		cp $(PROG) $(LOCAL_INST_DIR)/bin
 		$(POD2MAN) $(PROG) > $(LOCAL_INST_DIR)/man1/$(PROG).1
+
+.PHONY:	clean
+clean:
+		rm -fr doc
