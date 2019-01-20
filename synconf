@@ -43,7 +43,7 @@ BEGIN {
   $VERSION = $1;
 
   # default location of the (undehydrated) configuration file
-  $CONF_PATH = "$ENV{HOME}/opt/var/db/synconf.xml";
+  $CONF_PATH = "$ENV{HOME}/opt/etc/synconf.xml";
 
   $PROG = "synconf";
   $DEFAULT_BOPTIONS = "rltpgoDu";
